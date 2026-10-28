@@ -1,0 +1,30 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# ---- 工具输出 ----
+out/
+*.log
+
+# ---- 项目特定 ----
+# 打包前的临时源表：正式素材是 sources/CL.data，xmp 只在重打包时短暂存在
+sources/*.xmp
+# 生成物与备份
+*.dcp.bak
+*.xmp.bak
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
