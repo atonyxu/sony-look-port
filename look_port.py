@@ -17,6 +17,7 @@ CLI:
 """
 import argparse
 import hashlib
+import json
 import re
 import shutil
 import struct
@@ -419,12 +420,101 @@ def tone_compose(table, ev=0.0, toe=0.0, dro=0, x_hi=0.30):
     return np.clip(interp(table, moved), 0.0, 1.0).reshape(n, n, n, 3)
 
 
-def write_identity_dcp(model, prefix, out_dir, adobe=None, adobe_path=None, curve=None, tune=""):
+# ---------------------------------------------------------------- cross-body colour transfer
+#
+# The look tables were baked on the A7M5, and their input is that body's white-balanced linear camera
+# RGB. Feed another body's RGB in and the table reads the wrong coordinates: same colour, different
+# triple. The two spaces are related by the ratio of their ForwardMatrices (both map camera RGB to
+# XYZ D50), so:
+#
+#     M = inv(FM_A7M5) @ FM_this_body        row-normalised, so M·(1,1,1) = (1,1,1)
+#
+# Two places to apply it. Cheaper and per-illuminant-correct: fold it into the base profile, since
+# ACR computes working = inv(P) @ FM @ camera, so FM = P@M gives working = M·camera and ACR still
+# interpolates between the D65 and illuminant-A matrices by the shot's white balance. Alternative
+# (verified path, one illuminant only): rebake all 12 tables with M.
+SRC_MODEL = "Sony ILCE-7M5"
+
+_TRANSFER_CACHE = {}
+_BODY_REPORT = None
+
+# 与 A7M5 的距离怎么读：ΔE 均 < 1 不必换算，> 2.5 就值得开，max|M-I| > 0.5 时色域外裁切明显
+ADVICE_ZH = {"skip": "不必开换算",
+             "optional": "可选",
+             "yes": "建议开换算",
+             "yes-soft": "建议开，强度 0.6–0.8（色域外裁切较多）"}
+
+
+def body_report(model=None):
+    """sources/bodies.json: 每个机型与 A7M5 的矩阵距离和换算带来的 ΔE。缺文件时返回 None。"""
+    global _BODY_REPORT
+    if _BODY_REPORT is None:
+        try:
+            _BODY_REPORT = json.loads((SOURCE_DIR / "bodies.json").read_text(encoding="utf-8"))
+        except Exception:
+            _BODY_REPORT = {}
+    if model is None:
+        return _BODY_REPORT
+    return (_BODY_REPORT.get("bodies") or {}).get(model)
+
+
+def _forward_pair(model):
+    path, a = find_adobe_dcp(model)
+    if a is None or "ForwardMatrix1" not in a or "ForwardMatrix2" not in a:
+        return None
+    return (np.array(a["ForwardMatrix1"], float).reshape(3, 3),
+            np.array(a["ForwardMatrix2"], float).reshape(3, 3))
+
+
+def transfer_pair(model, strength=1.0):
+    """(M1, M2) that carry this body's camera RGB into A7M5's, or None if a matrix is missing.
+
+    strength blends towards the identity, which is how you keep a transfer from overshooting
+    saturated colours (a 3x3 is only a linear approximation of the CFA difference).
+    """
+    key = (model, round(float(strength), 4))
+    if key in _TRANSFER_CACHE:
+        return _TRANSFER_CACHE[key]
+    src, dst = _forward_pair(SRC_MODEL), _forward_pair(model)
+    if src is None or dst is None:
+        _TRANSFER_CACHE[key] = None
+        return None
+    out = []
+    for s, d in zip(src, dst):
+        m = np.linalg.inv(s) @ d
+        m = m / m.sum(1, keepdims=True)
+        if strength < 1.0:
+            m = (1.0 - strength) * np.eye(3) + strength * m
+            m = m / m.sum(1, keepdims=True)
+        out.append(m)
+    _TRANSFER_CACHE[key] = tuple(out)
+    return _TRANSFER_CACHE[key]
+
+
+def transfer_compose(table, M):
+    """Rebake a look table so it is evaluated in the source body's coordinates."""
+    import acr_encoding as E
+
+    n = table.shape[0]
+    q = np.arange(n) / (n - 1)
+    v = np.stack(np.meshgrid(q, q, q, indexing="ij"), -1).reshape(-1, 3)
+    lin = E.inverse(v) @ M.T
+    moved = np.clip(E.forward(lin), 0.0, 1.0)
+    return np.clip(interp(table, moved), 0.0, 1.0).reshape(n, n, n, 3)
+
+
+def write_identity_dcp(model, prefix, out_dir, adobe=None, adobe_path=None, curve=None, tune="",
+                       forward=None):
     """Base whose working RGB *is* the white-balanced camera RGB — what the look tables expect.
 
     ForwardMatrix is linear ProPhoto -> XYZ D50 for both illuminants, so ACR hands the look table
     camera RGB. ColorMatrix is only there because the format wants it; ACR uses ForwardMatrix when
     present. When Adobe's profile for this body is missing we borrow the A7M5 matrices and say so.
+
+    `forward` overrides the pair — that is how the cross-body transfer is applied: ACR computes
+    working = inv(P) @ FM @ camera, so setting FM = P @ M makes the working RGB equal M · camera,
+    i.e. the table sees the numbers an A7M5 would have recorded. Row-normalising M keeps the neutral
+    axis fixed, so white balance stays neutral.
     """
     name = f"{prefix} Linear Base (Identity)"
     if adobe is None:
@@ -443,8 +533,8 @@ def write_identity_dcp(model, prefix, out_dir, adobe=None, adobe_path=None, curv
     entries = [("UniqueCameraModel", 2, model), ("ProfileName", 2, name),
                ("ColorMatrix1", 10, cm1), ("ColorMatrix2", 10, cm2),
                ("CalibrationIlluminant1", 3, cal1), ("CalibrationIlluminant2", 3, cal2),
-               ("ForwardMatrix1", 10, PROPHOTO_TO_XYZ.tolist()),
-               ("ForwardMatrix2", 10, PROPHOTO_TO_XYZ.tolist()),
+               ("ForwardMatrix1", 10, (forward[0] if forward else PROPHOTO_TO_XYZ).tolist()),
+               ("ForwardMatrix2", 10, (forward[1] if forward else PROPHOTO_TO_XYZ).tolist()),
                ("ProfileToneCurve", 11, curve or [0.0, 0.0, 1.0, 1.0]),
                ("ProfileEmbedPolicy", 4, [0]), ("DefaultBlackRender", 4, [1]),
                ("ProfileCopyright", 2, f"look_port; {mats}")]
@@ -456,7 +546,7 @@ def write_identity_dcp(model, prefix, out_dir, adobe=None, adobe_path=None, curv
 
 
 def build(model=None, raw=None, out_dir="out", grid=32, src_dir=None, log=print,
-          ev=0.0, toe=0.0, dro=0, prefix=None):
+          ev=0.0, toe=0.0, dro=0, prefix=None, transfer=0.0, transfer_rebake=False):
     """Generate 12 look xmp + the identity base dcp for one body. Returns a result dict."""
     if raw:
         detected = model_from_raw(raw)
@@ -476,6 +566,23 @@ def build(model=None, raw=None, out_dir="out", grid=32, src_dir=None, log=print,
     src_n = next(iter(tabs.values())).shape[0]
     log(f"机型 {model} → 前缀 {prefix}；源表 {src_n}³ → 输出 {grid}³")
 
+    rep = body_report(model)
+    if rep:
+        log(f"与 A7M5 的差异：ΔE 均 {rep['de_mean']:.2f}，p95 {rep['de_p95']:.2f}，"
+            f"max|M-I| {rep['max_mi']:.3f} — {ADVICE_ZH.get(rep['advice'], '')}")
+
+    M_pair = None
+    if transfer and model == SRC_MODEL:
+        log(f"跨机型换算：{model} 就是源机，跳过")
+    elif transfer:
+        M_pair = transfer_pair(model, float(transfer))
+        if M_pair is None:
+            log("跨机型换算：这台机器的 Adobe 标准配置里没有 ForwardMatrix，跳过（按未换算生成）")
+        else:
+            d = float(np.abs(M_pair[0] - np.eye(3)).max())
+            where = "烘进 12 张表（只用 D65 那组矩阵）" if transfer_rebake else "折进底座 ForwardMatrix"
+            log(f"跨机型换算：A7M5 ← {model.replace('Sony ', '')}，max|M-I| {d:.3f}，强度 {transfer:g}，{where}")
+
     files = []
     curved = bool(ev or toe or dro)
     if curved:
@@ -484,6 +591,8 @@ def build(model=None, raw=None, out_dir="out", grid=32, src_dir=None, log=print,
         log(f"影调模仿：{pts}（线性→输出；烘进外观表，底座保持恒等曲线）")
     for look in LOOKS:
         tab = tabs[look]
+        if M_pair and transfer_rebake:                # 先换坐标，再叠影调
+            tab = transfer_compose(tab, M_pair[0])
         if curved:                                    # 在源网格上做，避免二次重采样的误差
             tab = tone_compose(tab, ev, toe, dro)
         tab = resample(tab, grid)
@@ -493,8 +602,18 @@ def build(model=None, raw=None, out_dir="out", grid=32, src_dir=None, log=print,
 
     adobe_path, adobe = find_adobe_dcp(model)
     # 影调已经烘进表里，底座的 ProfileToneCurve 必须回到恒等，否则会叠两次
-    tune = f"tone in tables: ev {ev:+.2f} toe {toe:.3f} dro Lv{dro}" if curved else ""
-    d = write_identity_dcp(model, prefix, out_dir, adobe, adobe_path, curve=None, tune=tune)
+    notes = []
+    if curved:
+        notes.append(f"tone in tables: ev {ev:+.2f} toe {toe:.3f} dro Lv{dro}")
+    if M_pair and not transfer_rebake:
+        notes.append(f"transfer {transfer:g} FM->A7M5")
+    elif M_pair:
+        notes.append(f"transfer {transfer:g} in tables")
+    forward = None
+    if M_pair and not transfer_rebake:
+        forward = tuple(PROPHOTO_TO_XYZ @ m for m in M_pair)
+    d = write_identity_dcp(model, prefix, out_dir, adobe, adobe_path, curve=None,
+                           tune="; ".join(notes), forward=forward)
     files.append(d)
     log(f"  base  {d.name}（{'用 ' + Path(adobe_path).name if adobe is not None else '未找到 Adobe 标准配置，ColorMatrix 借用 A7M5'}）")
     return dict(model=model, prefix=prefix, files=files, out_dir=out_dir, adobe=str(adobe_path) if adobe_path else None)
@@ -557,11 +676,16 @@ def main():
     ap.add_argument("--prefix", help="文件前缀，默认按机型推导（如 SonyA7R3）")
     ap.add_argument("--toe", type=float, default=0.0,
                     help="黑位裁切量（线性 0..1），0.003~0.008 清阴影，0.031 可去掉一整个传感器黑电平")
+    ap.add_argument("--transfer", type=float, default=0.0, metavar="0..1",
+                    help="跨机型色彩换算：把本机相机 RGB 换算到 A7M5 的坐标（默认 0=关，推荐 1.0）")
+    ap.add_argument("--transfer-rebake", action="store_true",
+                    help="换算写进 12 张外观表（默认写进底座 ForwardMatrix；两条路结果等价，前者只认一个光源）")
     ap.add_argument("--install", action="store_true", help="同时装进 Lightroom")
     ap.add_argument("--clean", action="store_true", help="安装时把共享目录里的同名旧文件移到备份目录")
     a = ap.parse_args()
     r = build(model=a.model, raw=a.raw, out_dir=a.out, src_dir=a.src,
-              ev=a.ev, toe=a.toe, dro=a.dro, prefix=a.prefix)
+              ev=a.ev, toe=a.toe, dro=a.dro, prefix=a.prefix,
+              transfer=a.transfer, transfer_rebake=a.transfer_rebake)
     if a.install:
         install(r["files"], clean=a.clean)
     print(f"\n生成 {len(r['files'])} 个文件到 {r['out_dir']}")

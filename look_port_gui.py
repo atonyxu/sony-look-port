@@ -70,6 +70,29 @@ class App(tk.Tk):
         ttk.Label(tgt, text="文件前缀").grid(row=2, column=0, sticky="e", padx=8, pady=6)
         ttk.Entry(tgt, textvariable=self.prefix_var, width=28).grid(row=2, column=1, sticky="w")
 
+        xf = ttk.Frame(tgt)
+        xf.grid(row=3, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 2))
+        self.xfer_on = tk.BooleanVar(value=False)
+        ttk.Checkbutton(xf, text="跨机型色彩换算（A7M5 ← 本机）", variable=self.xfer_on,
+                        command=self._toggle_xfer).pack(side="left")
+        ttk.Label(xf, text="强度").pack(side="left", padx=(14, 4))
+        self.xfer_val = tk.StringVar(value="1.0")
+        self.xfer_entry = ttk.Entry(xf, textvariable=self.xfer_val, width=5, state="disabled")
+        self.xfer_entry.pack(side="left")
+        ttk.Label(xf, text="方式").pack(side="left", padx=(12, 4))
+        self.xfer_how = tk.StringVar(value="底座")
+        self.xfer_box = ttk.Combobox(xf, textvariable=self.xfer_how, width=6, state="disabled",
+                                     values=["底座", "外观表"])
+        self.xfer_box.pack(side="left")
+        self.body_var = tk.StringVar(value="")
+        ttk.Label(tgt, textvariable=self.body_var, foreground="#08a").grid(
+            row=4, column=0, columnspan=2, sticky="w", padx=8)
+
+        ttk.Label(tgt, text="把本机相机 RGB 换算到 A7M5 的坐标，让外观表读到它熟悉的数值。A7R3 上约 1.5 ΔE，"
+                            "A9 / A6000 这类老机身才有明显必要；强度 <1 可避免饱和色被推过头。",
+                  wraplength=700, foreground="#666").grid(row=5, column=0, columnspan=2, sticky="w", padx=8,
+                                                          pady=(0, 6))
+
         tgt.columnconfigure(0, weight=1)
         tgt.columnconfigure(1, weight=1)
 
@@ -161,6 +184,12 @@ class App(tk.Tk):
     def clear(self):
         self.log.delete("1.0", "end")
 
+    def _toggle_xfer(self):
+        state = "normal" if self.xfer_on.get() else "disabled"
+        box = "readonly" if self.xfer_on.get() else "disabled"
+        self.xfer_entry.configure(state=state)
+        self.xfer_box.configure(state=box)
+
     def _toggle_tone(self):
         state = "normal" if self.tone_on.get() else "disabled"
         self.dro_box.configure(state="readonly" if self.tone_on.get() else "disabled")
@@ -169,9 +198,18 @@ class App(tk.Tk):
 
     def _update_prefix(self):
         try:
-            self.prefix_var.set(LP.short_prefix(LP.normalise_model(self.model_var.get())))
+            model = LP.normalise_model(self.model_var.get())
+            self.prefix_var.set(LP.short_prefix(model))
+            rep = LP.body_report(model)
+            if rep is None:
+                self.body_var.set("（没有这台机型的差异数据）" if model else "")
+            else:
+                tip = LP.ADVICE_ZH.get(rep["advice"], "")
+                self.body_var.set(f"与 A7M5 差异：ΔE 均 {rep['de_mean']:.2f}，p95 {rep['de_p95']:.2f}"
+                                  f"（max|M−I| {rep['max_mi']:.3f}）— {tip}")
         except Exception:
             self.prefix_var.set("—")
+            self.body_var.set("")
 
     def do_generate(self, install=False):
         model = self.model_var.get().strip()
@@ -191,6 +229,16 @@ class App(tk.Tk):
         else:
             dro, ev, toe = 0, 0.0, 0.0
         prefix = self.prefix_var.get().strip()
+        xfer = 0.0
+        if self.xfer_on.get():
+            try:
+                xfer = min(max(float(self.xfer_val.get() or 1), 0.0), 1.0)
+            except ValueError:
+                messagebox.showwarning("参数错误", "换算强度要填 0–1 的数字")
+                return
+
+        # 所有 Tk 取值必须在主线程做完：工作线程里碰 Tk 变量会把 Tcl 解释器弄坏
+        rebake = (self.xfer_how.get() == "外观表")
 
         self.gen_btn.state(["disabled"])
         self.ins_btn.state(["disabled"])
@@ -199,7 +247,8 @@ class App(tk.Tk):
         def work():
             try:
                 r = LP.build(model=model, raw=raw, out_dir=out, log=self.write,
-                             ev=ev, toe=toe, dro=dro, prefix=prefix)
+                             ev=ev, toe=toe, dro=dro, prefix=prefix,
+                             transfer=xfer, transfer_rebake=rebake)
                 self.last_files = r["files"]
                 if install:
                     LP.install(r["files"], clean=self.clean_var.get(), log=self.write)

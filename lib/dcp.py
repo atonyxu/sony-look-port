@@ -13,7 +13,7 @@ TAGS = {50708: "UniqueCameraModel", 50721: "ColorMatrix1", 50722: "ColorMatrix2"
         50932: "ProfileCalibrationSignature"}
 NAMES = {v: k for k, v in TAGS.items()}
 TSIZE = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 7: 1, 9: 4, 10: 8, 11: 4, 12: 8}
-TFMT = {1: "B", 3: "H", 4: "I", 9: "i", 11: "f", 12: "d"}
+TFMT = {1: "B", 2: "c", 3: "H", 4: "I", 5: "II", 6: "b", 7: "B", 8: "h", 9: "i", 10: "ii", 11: "f", 12: "d"}
 
 
 def read(path):
@@ -38,7 +38,9 @@ def read(path):
 
 
 def _rational(x):
-    d = 10000
+    # 1e6 keeps ForwardMatrix / ColorMatrix to ~1e-6, which matters when M is folded into them.
+    # 1e4 (Adobe's own denominator) leaves a 5e-5 error in every entry.
+    d = 1000000 if abs(x) < 2000 else 10000
     return int(round(x * d)), d
 
 
